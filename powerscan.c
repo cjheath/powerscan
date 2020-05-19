@@ -7,6 +7,7 @@
 #include	<string.h>
 #include	<stdbool.h>
 #include	<stdint.h>
+#include	<inttypes.h>
 #include	<math.h>
 
 #include	<SoapySDR/Device.h>
@@ -216,7 +217,7 @@ bool initialise_configuration(ProgramConfiguration* pc)
 	else
 		fprintf(stderr, "Scan continuously");
 	fprintf(stderr,
-		" from %lld to %lld (covering %lldHz in steps of %lldHz) in %d tuning%s each lasting %dms\n",
+		" from %" PRId64 " to %" PRId64 " (covering %" PRId64 "Hz in steps of %" PRId64 "Hz) in %d tuning%s each lasting %dms\n",
 		pc->start_frequency,
 		pc->end_frequency,
 		pc->end_frequency-pc->start_frequency,

@@ -18,7 +18,7 @@ set(INSTALL_DEFAULT_BINDIR "bin" CACHE STRING "Appended to CMAKE_INSTALL_PREFIX"
 #
 
 # Use the SoapySDR system:
-find_package(SoapySDR "0.7" NO_MODULE)
+find_package(SoapySDR "0.6" NO_MODULE)
 if (NOT SoapySDR_FOUND)
     message(FATAL_ERROR "Soapy SDR development files not found...")
 endif ()
