@@ -1,0 +1,14 @@
+*.o
+*.dSYM
+
+.*.swp
+
+**/*.o
+**/*.a
+powerscan
+
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+
