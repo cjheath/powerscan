@@ -7,6 +7,7 @@
 #include	<string.h>
 #include	<stdbool.h>
 #include	<stdint.h>
+#include	<unistd.h>
 #include	<inttypes.h>
 #include	<math.h>
 
@@ -18,11 +19,13 @@ typedef	int_least64_t	Frequency;
 #define	FFT_MAX_BITS	16
 #define	MIN_DWELL_TIME	100			// minimum time on each tuning, in milliseconds
 #define	MAX_CROP_RATIO	0.6			// Cropping more than this just doesn't make sense
+#define	RETUNE_USLEEP	5000			// 5ms. Why is this not built-in to Soapy?
 
 typedef struct
 {
 	const char*	sdr_name;		// The name of an SDR device known to SoapySDR
-//	const char*	sdr_configuration;	// Configuration options for the SDR device
+	int		sdr_channel;
+//	const char*	antenna;		// Which antenna to use
 
 	Frequency	start_frequency;	// Lowest frequency to report
 	Frequency	end_frequency;		// Highest frequency to report
@@ -33,12 +36,11 @@ typedef struct
 
 	float		crop_ratio;		// How much of each tuning range should we discard?
 
-//	const char*	antenna;		// Which antenna to use
-
 	FILE*		verbose;		// Where to send verbose output (NULL means don't)
 
 	/* Calculated or discovered configuration settings */
 	SoapySDRDevice*	device;
+	size_t		channel_count;		// How many channels are available on this device?
 	double*		sample_rates;		// Available sample rates
 	size_t		num_sample_rates;
 	double		sample_rate;		// Selected sample rate
@@ -55,17 +57,24 @@ ProgramConfiguration	config;
 
 // Function prototypes:
 bool		scan(ProgramConfiguration* pc);
+bool		retune(ProgramConfiguration* pc, Frequency frequency);
+bool		flush_data_after_config_change(ProgramConfiguration* pc);
 void		list_sdr_devices(FILE* fp);
 void		list_device_capabilities(ProgramConfiguration* pc);
 void		list_sample_rates(ProgramConfiguration* pc);
 void		select_sample_rate(ProgramConfiguration* pc);
 const char*	s_if_plural(int i) { return i != 1 ? "s" : ""; }
 bool		initialise_configuration(ProgramConfiguration* pc);
+const char*	setup_stream(ProgramConfiguration* pc);
 void		finalise_configuration(ProgramConfiguration* pc);
 void		default_parameters(ProgramConfiguration* pc);
 Frequency	frequency_from_str(const char* cp);
 void		usage(int exit_code);
 bool		gather_parameters(ProgramConfiguration* pc, int argc, char **argv);
+
+#ifdef _WIN32
+#define usleep(x) Sleep(x/1000)
+#endif
 
 int main(int argc, char **argv)
 {
@@ -85,9 +94,56 @@ int main(int argc, char **argv)
 
 bool scan(ProgramConfiguration* pc)
 {
-	fprintf(stderr, "Scanning is not yet implemented\n");
-	(void)pc;
+	SoapySDRDevice_setSampleRate(pc->device, SOAPY_SDR_RX, pc->sdr_channel, pc->sample_rate);
+
+	Frequency frequency = pc->tuning_start;
+	for (int i = 0; i < pc->tuning_count; i++, frequency += pc->tuning_bandwidth)
+	{
+		if (!retune(pc, frequency))
+			break;
+	}
+
 	return true;
+}
+
+bool retune(ProgramConfiguration* pc, Frequency frequency)
+{
+	SoapySDRKwargs args = {0};
+	if (0 != SoapySDRDevice_setFrequency(pc->device, SOAPY_SDR_RX, pc->sdr_channel, (double)frequency, &args))
+	{
+		fprintf(stderr, "Failed to set frequency %" PRId64 "Hz: %s\n", frequency, SoapySDRDevice_lastError());
+		return false;
+	}
+	if (pc->verbose)
+		fprintf(pc->verbose, "Tuned to %" PRId64 "\n", frequency);
+	if (!flush_data_after_config_change(pc))
+	{
+		fprintf(stderr, "Error: bad retune at %" PRId64 "Hz\n", frequency);
+		return false;
+	}
+	return true;
+}
+
+// This piece of crap should be hidden deep inside SoapySDR's APIs. I refuse to dignify it with configuration parameters.
+bool flush_data_after_config_change(ProgramConfiguration* pc)
+{
+	static int16_t	waste[(01<<16) * sizeof(int16_t) * 2] = {0};
+	int		r, i;
+
+	/* wait for settling and flush buffer */
+	usleep(RETUNE_USLEEP);
+
+	void*		buffs[] = { waste };
+	int		flags = 0;
+	long long	bufferTime = 0;		// in nanoseconds
+	long		timeout = 1000000;	// In microseconds
+
+	for (i = 0; i < 3; ++i) {
+		r = SoapySDRDevice_readStream(pc->device, pc->stream, buffs, (01<<16), &flags, &bufferTime, timeout);
+		if (r >= 0)
+			break;
+	}
+	return r >= 0;
 }
 
 void list_sdr_devices(FILE* fp)
@@ -125,8 +181,7 @@ void list_device_capabilities(ProgramConfiguration* pc)
 // Report the sample rates of this device (save what we need):
 void list_sample_rates(ProgramConfiguration* pc)
 {
-	// REVISIT: This hardwires receive channel 0
-	pc->sample_rates = SoapySDRDevice_listSampleRates(pc->device, SOAPY_SDR_RX, 0, &pc->num_sample_rates);
+	pc->sample_rates = SoapySDRDevice_listSampleRates(pc->device, SOAPY_SDR_RX, pc->sdr_channel, &pc->num_sample_rates);
 
 	if (pc->verbose)
 	{
@@ -151,6 +206,8 @@ void select_sample_rate(ProgramConfiguration* pc)
  */
 bool initialise_configuration(ProgramConfiguration* pc)
 {
+	const char*	error_p;
+
 	// Open the SDR device requested, or list available devices if that failed:
 	pc->device = SoapySDRDevice_makeStrArgs(pc->sdr_name);
 	if (!pc->device)
@@ -202,6 +259,7 @@ bool initialise_configuration(ProgramConfiguration* pc)
 
 	// Calculate how much bandwidth we get in each tuning, after cropping:
 	pc->tuning_bandwidth = (Frequency)ceil(pc->sample_rate*(1.0 - pc->crop_ratio));
+	pc->tuning_start = pc->start_frequency + pc->tuning_bandwidth/2;
 
 	// How many times must we tune to cover the frequency range:
 	pc->tuning_count = (int)ceil(total_scan / pc->tuning_bandwidth);
@@ -227,7 +285,39 @@ bool initialise_configuration(ProgramConfiguration* pc)
 		pc->dwell_time
 	);
 
+	error_p = setup_stream(pc);
+	if (error_p)
+	{
+		fprintf(stderr, "Can't setup stream: %s\n", error_p);
+		return false;
+	}
+
 	return true;
+}
+
+// Set up a receiver data stream on the specified channel
+const char* setup_stream(ProgramConfiguration* pc)
+{
+	SoapySDRKwargs	stream_args = {0};
+	size_t		sdr_channel = pc->sdr_channel;
+
+	pc->channel_count = SoapySDRDevice_getNumChannels(pc->device, SOAPY_SDR_RX);
+	if ((size_t)pc->sdr_channel >= pc->channel_count)
+	{
+		fprintf(stderr, "Device has only %zu channel%s\n", pc->channel_count, s_if_plural(pc->channel_count));
+		return "Invalid channel selected";
+	}
+
+#if SOAPY_SDR_API_VERSION < 0x00080000
+	// REVISIT: This Soapy API prints an [INFO] message without being asked
+	if (SoapySDRDevice_setupStream(pc->device, &pc->stream, SOAPY_SDR_RX, SOAPY_SDR_CS16, &sdr_channel, 1, &stream_args) != 0)
+		return SoapySDRDevice_lastError();
+#else
+	pc->stream = SoapySDRDevice_setupStream(pc->device, SOAPY_SDR_RX, SOAPY_SDR_CS16, &sdr_channel, 1, &stream_args);
+	if (pc->stream == NULL)
+		return SoapySDRDevice_lastError();
+#endif
+	return 0;
 }
 
 void finalise_configuration(ProgramConfiguration* pc)
@@ -293,7 +383,7 @@ bool gather_parameters(ProgramConfiguration* pc, int argc, char **argv)
 	int	opt;
 
 	default_parameters(pc);
-	while ((opt = getopt(argc, argv, "vd:a:s:e:r:c:1l:h?")) != -1) {
+	while ((opt = getopt(argc, argv, "vd:C:a:s:e:r:c:1l:h?")) != -1) {
 		switch (opt) {
 		case 'v':		// verbose output
 			pc->verbose = stderr;
@@ -306,6 +396,10 @@ bool gather_parameters(ProgramConfiguration* pc, int argc, char **argv)
 				list_sdr_devices(stdout);
 				return false;
 			}
+			break;
+
+		case 'C':
+			pc->sdr_channel = atol(optarg);
 			break;
 
 #if 0
