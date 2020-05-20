@@ -10,6 +10,7 @@
 #include	<unistd.h>
 #include	<inttypes.h>
 #include	<math.h>
+#include	<signal.h>
 
 #include	<SoapySDR/Device.h>
 #include	<SoapySDR/Formats.h>
@@ -54,6 +55,7 @@ typedef struct
 } ProgramConfiguration;
 
 ProgramConfiguration	config;
+int		signals_caught;
 
 // Function prototypes:
 bool		scan(ProgramConfiguration* pc);
@@ -67,6 +69,8 @@ const char*	s_if_plural(int i) { return i != 1 ? "s" : ""; }
 bool		initialise_configuration(ProgramConfiguration* pc);
 const char*	setup_stream(ProgramConfiguration* pc);
 void		finalise_configuration(ProgramConfiguration* pc);
+void		setup_interrupts();
+void		interrupt_request(void);
 void		default_parameters(ProgramConfiguration* pc);
 Frequency	frequency_from_str(const char* cp);
 void		usage(int exit_code);
@@ -85,7 +89,7 @@ int main(int argc, char **argv)
 		usage(0);
 
 	for (int repetition = 0; pc->repetition_limit == 0 || repetition < pc->repetition_limit; repetition++)
-		if (!scan(pc))
+		if (!scan(pc) || signals_caught >= 1)
 			break;
 
 	finalise_configuration(pc);
@@ -99,6 +103,8 @@ bool scan(ProgramConfiguration* pc)
 	Frequency frequency = pc->tuning_start;
 	for (int i = 0; i < pc->tuning_count; i++, frequency += pc->tuning_bandwidth)
 	{
+		if (signals_caught > 1)
+			return false;
 		if (!retune(pc, frequency))
 			break;
 	}
@@ -292,6 +298,8 @@ bool initialise_configuration(ProgramConfiguration* pc)
 		return false;
 	}
 
+	setup_interrupts();
+
 	return true;
 }
 
@@ -317,6 +325,10 @@ const char* setup_stream(ProgramConfiguration* pc)
 	if (pc->stream == NULL)
 		return SoapySDRDevice_lastError();
 #endif
+
+	SoapySDRDevice_activateStream(pc->device, pc->stream, 0, 0, 0);	// flags, timeout, numElems (burst control)
+	// REVISIT: direct dsampling
+	// REVISIT: offset tuning
 	return 0;
 }
 
@@ -330,6 +342,45 @@ void finalise_configuration(ProgramConfiguration* pc)
 	}
 	SoapySDRDevice_unmake(pc->device);
 	pc->device = 0;
+}
+
+#ifdef _WIN32
+BOOL WINAPI
+interrupt_handler(int signum)
+{
+	if (CTRL_C_EVENT == signum) {
+		interrupt_request();
+		return TRUE;
+	}
+	return FALSE;
+}
+#else
+void interrupt_handler(int signum)
+{
+	interrupt_request();
+}
+#endif
+
+void interrupt_request(void)
+{
+	fprintf(stderr, "Signal caught, %s.\n", signals_caught++ == 0 ? "finishing" : "abort");
+}
+
+void setup_interrupts()
+{
+#ifdef _WIN32
+	SetConsoleCtrlHandler((PHANDLER_ROUTINE)interrupt_handler, TRUE);
+#else
+	struct sigaction sa;
+	sa.sa_handler = interrupt_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGQUIT, &sa, NULL);
+	sigaction(SIGPIPE, &sa, NULL);
+	signal(SIGPIPE, SIG_IGN);
+#endif
 }
 
 void default_parameters(ProgramConfiguration* pc)
