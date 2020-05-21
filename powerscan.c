@@ -7,7 +7,6 @@
 #include	<string.h>
 #include	<stdbool.h>
 #include	<stdint.h>
-#include	<unistd.h>
 #include	<inttypes.h>
 #include	<math.h>
 #include	<signal.h>
@@ -15,10 +14,25 @@
 #include	<SoapySDR/Device.h>
 #include	<SoapySDR/Formats.h>
 
+#include	<fftw3.h>
+
+#ifdef _WIN32
+#include	<windows.h>
+#include	<fcntl.h>
+#include	<io.h>
+#include	"getopt/getopt.h"
+#define		usleep(x)	Sleep(x/1000)
+#define	_USE_MATH_DEFINES
+#else
+#include	<unistd.h>
+#include	<sys/time.h>			// For gettimeofday()
+#endif
+
 typedef	int_least64_t	Frequency;
+typedef	int_least64_t	ClockTime;
 
 #define	FFT_MAX_BITS	16
-#define	MIN_DWELL_TIME	100			// minimum time on each tuning, in milliseconds
+#define	MIN_DWELL_TIME	100000			// minimum time on each tuning, in microseconds
 #define	MAX_CROP_RATIO	0.6			// Cropping more than this just doesn't make sense
 #define	RETUNE_USLEEP	5000			// 5ms. Why is this not built-in to Soapy?
 
@@ -49,9 +63,11 @@ typedef struct
 	SoapySDRStream*	stream;
 
 	int		tuning_count;		// Number of times we have to retune for one scan
-	int		dwell_time;		// Number of seconds for each tuning
+	int		dwell_time;		// Number of microseconds for each tuning
 	Frequency	tuning_start;		// Initial centre frequency to tune
 	Frequency	tuning_bandwidth;	// Bandwidth to digitise
+
+	int_least64_t	last_buffer_time;	// Returned buffer timestamp
 } ProgramConfiguration;
 
 ProgramConfiguration	config;
@@ -61,6 +77,7 @@ int		signals_caught;
 bool		scan(ProgramConfiguration* pc);
 bool		retune(ProgramConfiguration* pc, Frequency frequency);
 bool		flush_data_after_config_change(ProgramConfiguration* pc);
+bool		receive_until_time(ProgramConfiguration* pc, Frequency frequency, ClockTime receive_end_time);
 void		list_sdr_devices(FILE* fp);
 void		list_device_capabilities(ProgramConfiguration* pc);
 void		list_sample_rates(ProgramConfiguration* pc);
@@ -73,14 +90,11 @@ const char*	setup_stream(ProgramConfiguration* pc);
 void		finalise_configuration(ProgramConfiguration* pc);
 void		setup_interrupts();
 void		interrupt_request(void);
+ClockTime	clock_time();
 void		default_parameters(ProgramConfiguration* pc);
 Frequency	frequency_from_str(const char* cp);
 void		usage(int exit_code);
 bool		gather_parameters(ProgramConfiguration* pc, int argc, char **argv);
-
-#ifdef _WIN32
-#define usleep(x) Sleep(x/1000)
-#endif
 
 int main(int argc, char **argv)
 {
@@ -102,12 +116,20 @@ bool scan(ProgramConfiguration* pc)
 {
 	SoapySDRDevice_setSampleRate(pc->device, SOAPY_SDR_RX, pc->sdr_channel, pc->sample_rate);
 
-	Frequency frequency = pc->tuning_start;
+	ClockTime	scan_start_time = clock_time();
+	Frequency	frequency = pc->tuning_start;
+
 	for (int i = 0; i < pc->tuning_count; i++, frequency += pc->tuning_bandwidth)
 	{
 		if (signals_caught > 1)
 			return false;
 		if (!retune(pc, frequency))
+			break;
+
+		// We should have a last_buffer_time from the retune. If not, use the scan start time.
+		ClockTime	receive_end_time = (pc->last_buffer_time > 0 ? pc->last_buffer_time/1000 : scan_start_time) + pc->dwell_time;
+
+		if (!receive_until_time(pc, frequency, receive_end_time))
 			break;
 	}
 
@@ -149,9 +171,52 @@ bool flush_data_after_config_change(ProgramConfiguration* pc)
 	for (i = 0; i < 3; ++i) {
 		r = SoapySDRDevice_readStream(pc->device, pc->stream, buffs, (01<<16), &flags, &bufferTime, timeout);
 		if (r >= 0)
+		{
+			pc->last_buffer_time = bufferTime;
 			break;
+		}
 	}
 	return r >= 0;
+}
+
+bool receive_until_time(ProgramConfiguration* pc, Frequency frequency, ClockTime receive_end_time)
+{
+	int16_t		buf16[65536*2];
+	void*		buffers[] = {buf16};
+	int		flags = 0;		// Flags received in the buffer header
+	long long	timestamp = 0;		// The timestamp on the received buffer
+	long		timeout = 1000000;	// Timeout on this read (microseconds)
+	int		r;
+
+	r = SoapySDRDevice_readStream(pc->device, pc->stream, buffers, 65536, &flags, &timestamp, timeout);
+	if (r < 0) {
+		fprintf(stderr, "Error: reading stream %d\n", r);
+		return false;
+	}
+	if (pc->last_buffer_time > 0)
+	{
+		if (pc->last_buffer_time/1000 < receive_end_time)
+			return true;		// Time is up based on buffer times
+		else if (clock_time() > receive_end_time)
+			return true;		// Wall clock time has expired
+	}
+
+	if (pc->verbose)
+		fprintf(pc->verbose, "Received %d bytes flags 0x%08X buffer time %" PRId64 "\n", r, flags, (int_least64_t)timestamp);
+
+	// REVISIT: If just one frequency_resolution per tuning, no FFT is needed
+
+	// REVISIT: Downsample
+
+	// REVISIT: Remove DC
+
+	// REVISIT: Window function
+
+	// REVISIT: FFT
+
+	// REVISIT: Accumulate bin power (and variance?)
+
+	return true;
 }
 
 void list_sdr_devices(FILE* fp)
@@ -309,7 +374,7 @@ void plan_tuning(ProgramConfiguration* pc)
 	pc->tuning_count = (int)ceil(total_scan / pc->tuning_bandwidth);
 
 	// How long can we dwell on each tuning:
-	pc->dwell_time = 1000*pc->scan_time/pc->tuning_count;
+	pc->dwell_time = 1000000*pc->scan_time/pc->tuning_count;
 	if (pc->dwell_time < MIN_DWELL_TIME)
 		pc->dwell_time = MIN_DWELL_TIME;
 
@@ -408,6 +473,14 @@ void setup_interrupts()
 	sigaction(SIGPIPE, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 #endif
+}
+
+ClockTime clock_time()
+{
+	struct timeval	tv;
+	gettimeofday(&tv, (void*)0);
+
+	return tv.tv_sec*1000000 + tv.tv_usec;
 }
 
 void default_parameters(ProgramConfiguration* pc)
