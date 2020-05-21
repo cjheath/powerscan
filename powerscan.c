@@ -67,6 +67,8 @@ void		list_sample_rates(ProgramConfiguration* pc);
 void		select_sample_rate(ProgramConfiguration* pc);
 const char*	s_if_plural(int i) { return i != 1 ? "s" : ""; }
 bool		initialise_configuration(ProgramConfiguration* pc);
+void		list_channel_variables(ProgramConfiguration* pc);
+void		plan_tuning(ProgramConfiguration* pc);
 const char*	setup_stream(ProgramConfiguration* pc);
 void		finalise_configuration(ProgramConfiguration* pc);
 void		setup_interrupts();
@@ -257,6 +259,42 @@ bool initialise_configuration(ProgramConfiguration* pc)
 	else if (pc->crop_ratio < 0)
 		pc->crop_ratio = 0;
 
+	// Display the native stream data format. We use CS16 anyway, for now.
+	double		full_scale = 0;
+	const char*	native_format = SoapySDRDevice_getNativeStreamFormat(pc->device, SOAPY_SDR_RX, pc->sdr_channel, &full_scale);
+	fprintf(stderr, "Native stream format is %s with fullscale of %g\n", native_format, full_scale);
+
+	list_channel_variables(pc);
+
+	plan_tuning(pc);
+
+	error_p = setup_stream(pc);
+	if (error_p)
+	{
+		fprintf(stderr, "Can't setup stream: %s\n", error_p);
+		return false;
+	}
+
+	setup_interrupts();
+
+	return true;
+}
+
+void list_channel_variables(ProgramConfiguration* pc)
+{
+	// Fetch and list any channe; information variables for this channel:
+	SoapySDRKwargs	channel_info = SoapySDRDevice_getChannelInfo(pc->device, SOAPY_SDR_RX, pc->sdr_channel);
+	if (pc->verbose && channel_info.size > 0)
+	{
+		fprintf(pc->verbose, "%ld info items for channel %d: ", channel_info.size, pc->sdr_channel);
+		for (int j = 0; j < channel_info.size; j++)
+			fprintf(pc->verbose, "%s=%s ", channel_info.keys[j], channel_info.vals[j]);
+		fprintf(pc->verbose, "\n");
+	}
+}
+
+void plan_tuning(ProgramConfiguration* pc)
+{
 	// We overscan at each end by the half the crop amount:
 	Frequency	total_scan =
 		pc->end_frequency
@@ -290,17 +328,6 @@ bool initialise_configuration(ProgramConfiguration* pc)
 		s_if_plural(pc->tuning_count),
 		pc->dwell_time
 	);
-
-	error_p = setup_stream(pc);
-	if (error_p)
-	{
-		fprintf(stderr, "Can't setup stream: %s\n", error_p);
-		return false;
-	}
-
-	setup_interrupts();
-
-	return true;
 }
 
 // Set up a receiver data stream on the specified channel
