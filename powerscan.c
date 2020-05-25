@@ -67,7 +67,8 @@ typedef struct
 	Frequency	tuning_start;		// Initial centre frequency to tune
 	Frequency	tuning_bandwidth;	// Bandwidth to digitise
 
-	int_least64_t	last_buffer_time;	// Returned buffer timestamp
+	int_least64_t	last_time;		// Returned buffer timestamp or clock time received
+	int_least64_t	first_time;		// First returned buffer timestamp or clock time received
 } ProgramConfiguration;
 
 ProgramConfiguration	config;
@@ -77,7 +78,8 @@ int		signals_caught;
 bool		scan(ProgramConfiguration* pc);
 bool		retune(ProgramConfiguration* pc, Frequency frequency);
 bool		flush_data_after_config_change(ProgramConfiguration* pc);
-bool		receive_until_time(ProgramConfiguration* pc, Frequency frequency, ClockTime receive_end_time);
+bool		receive_block(ProgramConfiguration* pc, Frequency frequency);
+void		print_soapy_flags(FILE* fp, int flags);
 void		list_sdr_devices(FILE* fp);
 void		list_device_capabilities(ProgramConfiguration* pc);
 void		list_sample_rates(ProgramConfiguration* pc);
@@ -126,11 +128,12 @@ bool scan(ProgramConfiguration* pc)
 		if (!retune(pc, frequency))
 			break;
 
-		// We should have a last_buffer_time from the retune. If not, use the scan start time.
-		ClockTime	receive_end_time = (pc->last_buffer_time > 0 ? pc->last_buffer_time/1000 : scan_start_time) + pc->dwell_time;
+		// We should have a last_time from the buffer flush during retune. If not, use the scan start time.
+		ClockTime	receive_end_time = pc->last_time + pc->dwell_time;
 
-		if (!receive_until_time(pc, frequency, receive_end_time))
-			break;
+		while (pc->last_time < receive_end_time)
+			if (!receive_block(pc, frequency))
+				break;
 	}
 
 	return true;
@@ -165,44 +168,48 @@ bool flush_data_after_config_change(ProgramConfiguration* pc)
 
 	void*		buffs[] = { waste };
 	int		flags = 0;
-	long long	bufferTime = 0;		// in nanoseconds
+	long long	buffer_time = 0;	// in nanoseconds
 	long		timeout = 1000000;	// In microseconds
 
-	for (i = 0; i < 3; ++i) {
-		r = SoapySDRDevice_readStream(pc->device, pc->stream, buffs, (01<<16), &flags, &bufferTime, timeout);
+	for (i = 0; i < 3; i++)
+	{
+		r = SoapySDRDevice_readStream(pc->device, pc->stream, buffs, (01<<16), &flags, &buffer_time, timeout);
 		if (r >= 0)
 		{
-			pc->last_buffer_time = bufferTime;
+			pc->last_time = flags&SOAPY_SDR_HAS_TIME ? buffer_time/1000 : clock_time();
+			if (!pc->first_time)
+				pc->first_time = pc->last_time;
 			break;
 		}
 	}
 	return r >= 0;
 }
 
-bool receive_until_time(ProgramConfiguration* pc, Frequency frequency, ClockTime receive_end_time)
+bool receive_block(ProgramConfiguration* pc, Frequency frequency)
 {
 	int16_t		buf16[65536*2];
 	void*		buffers[] = {buf16};
 	int		flags = 0;		// Flags received in the buffer header
-	long long	timestamp = 0;		// The timestamp on the received buffer
+	long long	buffer_time = 0;	// The timestamp on the received buffer
+	long long	this_time = 0;
 	long		timeout = 1000000;	// Timeout on this read (microseconds)
 	int		r;
 
-	r = SoapySDRDevice_readStream(pc->device, pc->stream, buffers, 65536, &flags, &timestamp, timeout);
+	r = SoapySDRDevice_readStream(pc->device, pc->stream, buffers, 65536, &flags, &buffer_time, timeout);
 	if (r < 0) {
 		fprintf(stderr, "Error: reading stream %d\n", r);
 		return false;
 	}
-	if (pc->last_buffer_time > 0)
-	{
-		if (pc->last_buffer_time/1000 < receive_end_time)
-			return true;		// Time is up based on buffer times
-		else if (clock_time() > receive_end_time)
-			return true;		// Wall clock time has expired
-	}
-
+	this_time = flags&SOAPY_SDR_HAS_TIME ? buffer_time/1000 : clock_time();
+	if (!pc->first_time)
+		pc->first_time = this_time;
 	if (pc->verbose)
-		fprintf(pc->verbose, "Received %d bytes flags 0x%08X %s time %" PRId64 "\n", r, flags, timestamp ? "buffer" : "clock", (int_least64_t)(timestamp ? timestamp : clock_time()));
+	{
+		fprintf(pc->verbose, "Received %d bytes %s time %" PRId64 " ", r, buffer_time ? "buffer" : "clock", (int_least64_t)this_time-pc->first_time);
+		print_soapy_flags(pc->verbose, flags);
+		fprintf(pc->verbose, "\n");
+	}
+	pc->last_time = this_time;
 
 	// REVISIT: If just one frequency_resolution per tuning, no FFT is needed
 
@@ -217,6 +224,35 @@ bool receive_until_time(ProgramConfiguration* pc, Frequency frequency, ClockTime
 	// REVISIT: Accumulate bin power (and variance?)
 
 	return true;
+}
+
+void print_soapy_flags(FILE* fp, int flags)
+{
+	if (!fp)
+		return;
+	fprintf(fp, "flags=");
+	for (int i = 01; i; i <<= 1)
+	{
+		if ((flags & i) == 0)
+			continue;
+		switch (i)
+		{
+		case SOAPY_SDR_END_BURST:
+			fprintf(fp, "end-burst "); break;
+		case SOAPY_SDR_HAS_TIME:
+			fprintf(fp, "has-time "); break;
+		case SOAPY_SDR_END_ABRUPT:
+			fprintf(fp, "end-abrupt "); break;
+		case SOAPY_SDR_ONE_PACKET:
+			fprintf(fp, "one-packet "); break;
+		case SOAPY_SDR_MORE_FRAGMENTS:
+			fprintf(fp, "more-fragments "); break;
+		case SOAPY_SDR_WAIT_TRIGGER:
+			fprintf(fp, "wait-trigger "); break;
+		default:
+			fprintf(fp, "0x%0X ", i); break;
+		}
+	}
 }
 
 void list_sdr_devices(FILE* fp)
@@ -258,9 +294,10 @@ void list_sample_rates(ProgramConfiguration* pc)
 
 	if (pc->verbose)
 	{
-		fprintf(pc->verbose, "SoapySDR Device (Channel 0 Receive) has %zu sample rates:\n", pc->num_sample_rates);
+		fprintf(pc->verbose, "SoapySDR Device (Channel 0 Receive) has %zu sample rates:", pc->num_sample_rates);
 		for (int i = 0; i < pc->num_sample_rates; i++)
-			fprintf(pc->verbose, "\t%.0f\n", pc->sample_rates[i]);
+			fprintf(pc->verbose, " %.0f", pc->sample_rates[i]);
+		fprintf(pc->verbose, "\n");
 	}
 }
 
@@ -536,7 +573,7 @@ bool gather_parameters(ProgramConfiguration* pc, int argc, char **argv)
 	int	opt;
 
 	default_parameters(pc);
-	while ((opt = getopt(argc, argv, "vd:C:a:s:e:r:c:1l:h?")) != -1) {
+	while ((opt = getopt(argc, argv, "vd:C:a:s:e:r:c:1l:t:h?")) != -1) {
 		switch (opt) {
 		case 'v':		// verbose output
 			pc->verbose = stderr;
