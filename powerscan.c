@@ -202,7 +202,7 @@ bool receive_until_time(ProgramConfiguration* pc, Frequency frequency, ClockTime
 	}
 
 	if (pc->verbose)
-		fprintf(pc->verbose, "Received %d bytes flags 0x%08X buffer time %" PRId64 "\n", r, flags, (int_least64_t)(timestamp ? timestamp : clock_time()));
+		fprintf(pc->verbose, "Received %d bytes flags 0x%08X %s time %" PRId64 "\n", r, flags, timestamp ? "buffer" : "clock", (int_least64_t)(timestamp ? timestamp : clock_time()));
 
 	// REVISIT: If just one frequency_resolution per tuning, no FFT is needed
 
