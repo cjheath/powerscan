@@ -371,7 +371,7 @@ void plan_tuning(ProgramConfiguration* pc)
 	pc->tuning_start = pc->start_frequency + pc->tuning_bandwidth/2;
 
 	// How many times must we tune to cover the frequency range:
-	pc->tuning_count = (int)ceil(total_scan / pc->tuning_bandwidth);
+	pc->tuning_count = (int)ceil((double)total_scan / pc->tuning_bandwidth);
 
 	// How long can we dwell on each tuning:
 	pc->dwell_time = 1000000*pc->scan_time/pc->tuning_count;
@@ -384,13 +384,15 @@ void plan_tuning(ProgramConfiguration* pc)
 	else
 		fprintf(stderr, "Scan continuously");
 	fprintf(stderr,
-		" from %" PRId64 " to %" PRId64 " (covering %" PRId64 "Hz in steps of %" PRId64 "Hz) in %d tuning%s each lasting %dms\n",
+		" from %" PRId64 " to %" PRId64 " (covering %" PRId64 "Hz in steps of %" PRId64 "Hz) in %d tuning%s at %" PRId64 "bps using %" PRId64 "Hz lasting %dms\n",
 		pc->start_frequency,
 		pc->end_frequency,
 		pc->end_frequency-pc->start_frequency,
 		pc->frequency_resolution,
 		pc->tuning_count,
 		s_if_plural(pc->tuning_count),
+		(long long)pc->sample_rate,
+		pc->tuning_bandwidth,
 		pc->dwell_time/1000
 	);
 }
