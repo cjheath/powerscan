@@ -8,7 +8,9 @@
 #include	<stdbool.h>
 #include	<stdint.h>
 #include	<inttypes.h>
+#include	<complex.h>
 #include	<math.h>
+#include	<assert.h>
 #include	<signal.h>
 
 #include	<SoapySDR/Device.h>
@@ -31,20 +33,23 @@
 typedef	int_least64_t	Frequency;
 typedef	int_least64_t	ClockTime;
 
-#define	FFT_MAX_BITS	16
+#define	FFT_MAX_BITS	16			// 65536 element FFT at most
 #define	MIN_DWELL_TIME	100000			// minimum time on each tuning, in microseconds
 #define	MAX_CROP_RATIO	0.6			// Cropping more than this just doesn't make sense
 #define	RETUNE_USLEEP	5000			// 5ms. Why is this not built-in to Soapy?
+#define	MAX_SAMPLES 	(01<<FFT_MAX_BITS)	// Maximum number of I/Q sample pairs to receive in each buffer
 
 typedef struct
 {
 	const char*	sdr_name;		// The name of an SDR device known to SoapySDR
 	int		sdr_channel;
 //	const char*	antenna;		// Which antenna to use
+	int		gain;			// db of gain to use
 
 	Frequency	start_frequency;	// Lowest frequency to report
 	Frequency	end_frequency;		// Highest frequency to report
 	Frequency	frequency_resolution;	// Size of frequency step to report
+	Frequency	requested_sample_rate;	// Don't try to go faster than this, if set
 
 	int		repetition_limit;	// Number of times to scan the range (0 = continuous)
 	int		scan_time;		// Number of seconds for one scan (default = 10)
@@ -60,12 +65,27 @@ typedef struct
 	size_t		num_sample_rates;
 	double		sample_rate;		// Selected sample rate
 
+	/* Runtime variables */
 	SoapySDRStream*	stream;
 
 	int		tuning_count;		// Number of times we have to retune for one scan
 	int		dwell_time;		// Number of microseconds for each tuning
 	Frequency	tuning_start;		// Initial centre frequency to tune
 	Frequency	tuning_bandwidth;	// Bandwidth to digitise
+	Frequency	current_frequency;	// Current frequency tuned
+
+	/* FFT variables */
+	int		fft_size;		
+	fftwf_complex*	fftw_in;		// FFT input buffer
+	fftwf_complex*	fftw_out;		// FFT output buffer. [0] is DC, then center to min-freq = max-freq back to centre 
+	fftwf_plan	fftw_plan;		// FFTW's plan
+	float*		window;			// FFT Window function
+	int		fft_fill;		// Next fftw_in slot to fill
+	float*		fft_power;		// Power per frequency for this FFT
+
+	float*		power_accumulation;	// Accumulated power over the entire scan (all tunings)
+	long		accumulation_count;	// How many times have we accumulated power (across all tunings)
+	int		power_buckets;		// Number of accumulated power buckets over the entire scan
 
 	int_least64_t	last_time;		// Returned buffer timestamp or clock time received
 	int_least64_t	first_time;		// First returned buffer timestamp or clock time received
@@ -79,6 +99,8 @@ bool		scan(ProgramConfiguration* pc);
 bool		retune(ProgramConfiguration* pc, Frequency frequency);
 bool		flush_data_after_config_change(ProgramConfiguration* pc);
 bool		receive_block(ProgramConfiguration* pc, Frequency frequency);
+void		process_buffer(ProgramConfiguration* pc, int16_t* buf16, int samples);
+void		handle_fft_out(ProgramConfiguration* pc);
 void		print_soapy_flags(FILE* fp, int flags);
 void		list_sdr_devices(FILE* fp);
 void		list_device_capabilities(ProgramConfiguration* pc);
@@ -90,6 +112,7 @@ void		list_channel_variables(ProgramConfiguration* pc);
 void		plan_tuning(ProgramConfiguration* pc);
 const char*	setup_stream(ProgramConfiguration* pc);
 void		finalise_configuration(ProgramConfiguration* pc);
+bool		plan_fft(ProgramConfiguration* pc);
 void		setup_interrupts();
 void		interrupt_request(void);
 ClockTime	clock_time();
@@ -154,13 +177,14 @@ bool retune(ProgramConfiguration* pc, Frequency frequency)
 		fprintf(stderr, "Error: bad retune at %" PRId64 "Hz\n", frequency);
 		return false;
 	}
+	pc->current_frequency = frequency;
 	return true;
 }
 
 // This piece of crap should be hidden deep inside SoapySDR's APIs. I refuse to dignify it with configuration parameters.
 bool flush_data_after_config_change(ProgramConfiguration* pc)
 {
-	static int16_t	waste[(01<<16) * sizeof(int16_t) * 2] = {0};
+	int16_t		waste[MAX_SAMPLES * 2] = {0};
 	int		r, i;
 
 	/* wait for settling and flush buffer */
@@ -168,12 +192,12 @@ bool flush_data_after_config_change(ProgramConfiguration* pc)
 
 	void*		buffs[] = { waste };
 	int		flags = 0;
-	long long	buffer_time = 0;	// in nanoseconds
+	long long	buffer_time = 0;	// in nanoseconds (if set; SoapyHackRF doesn't set it)
 	long		timeout = 1000000;	// In microseconds
 
-	for (i = 0; i < 3; i++)
+	for (i = 0; i < 3; i++)		// REVISIT: Why 3?
 	{
-		r = SoapySDRDevice_readStream(pc->device, pc->stream, buffs, (01<<16), &flags, &buffer_time, timeout);
+		r = SoapySDRDevice_readStream(pc->device, pc->stream, buffs, MAX_SAMPLES, &flags, &buffer_time, timeout);
 		if (r >= 0)
 		{
 			pc->last_time = flags&SOAPY_SDR_HAS_TIME ? buffer_time/1000 : clock_time();
@@ -187,17 +211,17 @@ bool flush_data_after_config_change(ProgramConfiguration* pc)
 
 bool receive_block(ProgramConfiguration* pc, Frequency frequency)
 {
-	int16_t		buf16[65536*2];
+	int16_t		buf16[MAX_SAMPLES*2];
 	void*		buffers[] = {buf16};
 	int		flags = 0;		// Flags received in the buffer header
 	long long	buffer_time = 0;	// The timestamp on the received buffer
-	long long	this_time = 0;
+	long long	this_time = 0;		// In microseconds
 	long		timeout = 1000000;	// Timeout on this read (microseconds)
-	int		r;
+	int		samples;
 
-	r = SoapySDRDevice_readStream(pc->device, pc->stream, buffers, 65536, &flags, &buffer_time, timeout);
-	if (r < 0) {
-		fprintf(stderr, "Error: reading stream %d\n", r);
+	samples = SoapySDRDevice_readStream(pc->device, pc->stream, buffers, MAX_SAMPLES, &flags, &buffer_time, timeout);
+	if (samples < 0) {
+		fprintf(stderr, "Error: reading stream %d\n", samples);
 		return false;
 	}
 	this_time = flags&SOAPY_SDR_HAS_TIME ? buffer_time/1000 : clock_time();
@@ -205,25 +229,88 @@ bool receive_block(ProgramConfiguration* pc, Frequency frequency)
 		pc->first_time = this_time;
 	if (pc->verbose)
 	{
-		fprintf(pc->verbose, "Received %d bytes %s time %" PRId64 " ", r, buffer_time ? "buffer" : "clock", (int_least64_t)this_time-pc->first_time);
-		print_soapy_flags(pc->verbose, flags);
-		fprintf(pc->verbose, "\n");
+		if (0)
+		{
+			fprintf(pc->verbose, "Received %d samples %s time %" PRId64 " ", samples, buffer_time ? "buffer" : "clock", (int_least64_t)this_time-pc->first_time);
+			print_soapy_flags(pc->verbose, flags);
+			fprintf(pc->verbose, "\n");
+		}
+
+		if (0)
+		{
+			// Look at the dynamic range of the data
+			int min = 32767, max = -32767;
+			for (int s = 0; s < 2*samples; s++) {
+				if (min > buf16[s])
+					min = buf16[s];
+				if (max < buf16[s])
+					max = buf16[s];
+			}
+			fprintf(stderr, "min=%d, max=%d\n", min/256, max/256);
+		}
+
+		// Automatic gain control here?
 	}
 	pc->last_time = this_time;
 
-	// REVISIT: If just one frequency_resolution per tuning, no FFT is needed
-
-	// REVISIT: Downsample
-
-	// REVISIT: Remove DC
-
-	// REVISIT: Window function
-
-	// REVISIT: FFT
-
-	// REVISIT: Accumulate bin power (and variance?)
-
+	process_buffer(pc, buf16, samples);
 	return true;
+}
+
+void process_buffer(ProgramConfiguration* pc, int16_t* buf16, int samples)
+{
+	while (samples > 0)
+	{
+		fftwf_complex	c = (float)buf16[0] + I*(float)buf16[1];
+		// Normalise samples to 0..1, multiplied by the window function
+		pc->fftw_in[pc->fft_fill] = c * pc->window[pc->fft_fill] / 32768;
+		buf16 += 2;
+		samples--;
+		if (++pc->fft_fill >= pc->fft_size)
+		{
+			fftwf_execute(pc->fftw_plan);
+			handle_fft_out(pc);
+			pc->fft_fill = 0;
+		}
+	}
+}
+
+void	handle_fft_out(ProgramConfiguration* pc)
+{
+	for (int s = 1; s < pc->fft_size; s++)
+	{
+		// fftw_out[0] is DC, then center to min-freq = max-freq back to centre 
+		// REVISIT: Re-order the FFT output bins from min-freq to max-freq
+		pc->fft_power[s-1] = cabs(pc->fftw_out[s] /* /pc->fft_size */);
+	}
+
+	// REVISIT: Accumulate bin power variance?
+
+	// Summarise into 80 bins for terminal output:
+	if (0)
+	{
+		int	width = 79;
+		int	stride = (pc->fft_size-1)/width;
+		for (int s = 0; s < pc->fft_size-stride; s += stride)
+		{
+			float sum = 0;
+			for (int j = 0; j < stride; j++)
+				sum += pc->fft_power[s+j];
+			fprintf(stderr, "%d: %d\n", s/stride, (int)floor(sum/stride));
+		}
+		exit(0);
+	}
+
+	Frequency	lowest_frequency_retained = (pc->current_frequency-pc->tuning_bandwidth/2);
+	int		lowest_bin = (lowest_frequency_retained - pc->start_frequency)/pc->frequency_resolution;
+	int		bin_count = pc->tuning_bandwidth/pc->frequency_resolution;
+
+	if (lowest_bin < 0 || lowest_bin+bin_count > pc->power_buckets)
+		return;	// Sometimes happens on interrupt
+
+	for (int s = 0; s < bin_count; s++)
+		pc->power_accumulation[lowest_bin+s] += pc->fft_power[s];
+	pc->accumulation_count++;
 }
 
 void print_soapy_flags(FILE* fp, int flags)
@@ -238,7 +325,7 @@ void print_soapy_flags(FILE* fp, int flags)
 		switch (i)
 		{
 		case SOAPY_SDR_END_BURST:
-			fprintf(fp, "end-burst "); break;
+			fprintf(fp, "end-burst "); break;	// Last packet of a burst
 		case SOAPY_SDR_HAS_TIME:
 			fprintf(fp, "has-time "); break;
 		case SOAPY_SDR_END_ABRUPT:
@@ -246,7 +333,7 @@ void print_soapy_flags(FILE* fp, int flags)
 		case SOAPY_SDR_ONE_PACKET:
 			fprintf(fp, "one-packet "); break;
 		case SOAPY_SDR_MORE_FRAGMENTS:
-			fprintf(fp, "more-fragments "); break;
+			fprintf(fp, "more-fragments "); break;	// not last packet of this fragment
 		case SOAPY_SDR_WAIT_TRIGGER:
 			fprintf(fp, "wait-trigger "); break;
 		default:
@@ -288,6 +375,7 @@ void list_device_capabilities(ProgramConfiguration* pc)
 }
 
 // Report the sample rates of this device (save what we need):
+// REVISIT: Provide a command-line argument to list these:
 void list_sample_rates(ProgramConfiguration* pc)
 {
 	pc->sample_rates = SoapySDRDevice_listSampleRates(pc->device, SOAPY_SDR_RX, pc->sdr_channel, &pc->num_sample_rates);
@@ -304,9 +392,10 @@ void list_sample_rates(ProgramConfiguration* pc)
 // Select the maximum sample rate
 void select_sample_rate(ProgramConfiguration* pc)
 {
-	// REVISIT: Provide a sample rate limit configuration parameter
+	// Choose the highest sample rate not greater than requested
 	for (int i = 0; i < pc->num_sample_rates; i++)
-		if (pc->sample_rate < pc->sample_rates[i])
+		if (pc->sample_rates[i] > pc->sample_rate	// Faster than we've seen
+		 && (pc->requested_sample_rate == 0 || pc->sample_rates[i] <= pc->requested_sample_rate))
 			pc->sample_rate = pc->sample_rates[i];
 }
 
@@ -329,31 +418,12 @@ bool initialise_configuration(ProgramConfiguration* pc)
 		return false;
 	}
 
+	// Provide verbose output if requested:
 	list_device_capabilities(pc);
 
 	list_sample_rates(pc);
 
 	select_sample_rate(pc);
-
-	if (pc->start_frequency <= 0)
-	{
-		fprintf(stderr, "No start frequency was given\n");
-		return false;
-	}
-
-	if (pc->end_frequency <= pc->start_frequency)
-	{
-		// Use the SDR device bandwidth around the start frequency
-		pc->end_frequency = pc->start_frequency + (Frequency)floor(pc->sample_rate/2);
-		pc->start_frequency = pc->end_frequency - (Frequency)floor(pc->sample_rate);
-	}
-
-	if (pc->frequency_resolution == 0)
-	{
-		pc->frequency_resolution = pc->sample_rate/(01<<FFT_MAX_BITS);
-		if (pc->frequency_resolution == 0)
-			pc->frequency_resolution = 1;
-	}
 
 	// Limit the crop ratio to something sensible:
 	if (pc->crop_ratio > MAX_CROP_RATIO)
@@ -361,10 +431,47 @@ bool initialise_configuration(ProgramConfiguration* pc)
 	else if (pc->crop_ratio < 0)
 		pc->crop_ratio = 0;
 
+	if (pc->start_frequency <= 0)
+	{
+		fprintf(stderr, "No start frequency was given\n");
+		return false;
+	}
+
+	if (pc->end_frequency > 0 && pc->end_frequency <= pc->start_frequency)
+	{
+		fprintf(stderr, "Ignoring end frequency below start frequency\n");
+		pc->end_frequency = 0;
+	}
+
+	if (pc->end_frequency <= 0)
+	{		// Center around start frequency, maximum bandwidth
+		Frequency	default_bandwidth = pc->sample_rate * (1 - pc->crop_ratio);
+		pc->end_frequency = pc->start_frequency + default_bandwidth/2;
+		pc->start_frequency = pc->end_frequency - default_bandwidth;
+	}
+
+	if (pc->frequency_resolution != 0
+	 && floor(pc->sample_rate / pc->frequency_resolution) > MAX_SAMPLES)
+	{
+		fprintf(stderr, "Requested frequency resolution is too small, setting it to %ld\n", (long)floor(pc->sample_rate/MAX_SAMPLES));
+		pc->frequency_resolution = 0;
+	}
+	if (pc->frequency_resolution == 0)
+	{
+		pc->frequency_resolution = floor(pc->sample_rate/MAX_SAMPLES);
+		if (pc->frequency_resolution == 0)
+			pc->frequency_resolution = 1;	// Do any SDRs have a sample rate below 65536 SPS?
+	}
+
 	// Display the native stream data format. We use CS16 anyway, for now.
 	double		full_scale = 0;
 	const char*	native_format = SoapySDRDevice_getNativeStreamFormat(pc->device, SOAPY_SDR_RX, pc->sdr_channel, &full_scale);
 	fprintf(stderr, "Native stream format is %s with fullscale of %g\n", native_format, full_scale);
+
+	// HackR LNA max is 40, VGA 62, AMP 14, total 116
+	if (SoapySDRDevice_setGain(pc->device, SOAPY_SDR_RX, pc->sdr_channel, pc->gain) != 0) {
+		fprintf(stderr, "Failed to set gain\n");
+	}
 
 	list_channel_variables(pc);
 
@@ -377,11 +484,15 @@ bool initialise_configuration(ProgramConfiguration* pc)
 		return false;
 	}
 
+	if (!plan_fft(pc))
+		return false;
+
 	setup_interrupts();
 
 	return true;
 }
 
+// REVISIT: Provide command-line arguments for setting these, and a help option to list them:
 void list_channel_variables(ProgramConfiguration* pc)
 {
 	// Fetch and list any channe; information variables for this channel:
@@ -395,6 +506,7 @@ void list_channel_variables(ProgramConfiguration* pc)
 	}
 }
 
+// Figure out how many times we need to retune to cover the requested bandwidth
 void plan_tuning(ProgramConfiguration* pc)
 {
 	// We overscan at each end by the half the crop amount:
@@ -432,6 +544,49 @@ void plan_tuning(ProgramConfiguration* pc)
 		pc->tuning_bandwidth,
 		pc->dwell_time/1000
 	);
+}
+
+bool plan_fft(ProgramConfiguration* pc)
+{
+	pc->fft_size = pc->sample_rate / pc->frequency_resolution;
+	pc->fft_size = 8192;
+	pc->fft_fill = 0;
+	if (pc->fft_size < 4)
+		pc->fft_size = 4;
+	pc->frequency_resolution = pc->sample_rate/pc->fft_size;
+
+	pc->power_buckets = (pc->end_frequency - pc->start_frequency + pc->frequency_resolution-1)/pc->frequency_resolution;
+
+	fprintf(stderr, "Sample Rate\t%g\n", pc->sample_rate);
+	fprintf(stderr, "FFT Size\t%d\n", pc->fft_size);
+	fprintf(stderr, "Frequency Resolution \t%" PRId64 "\n", pc->frequency_resolution);
+	fprintf(stderr, "Power buckets\t%d\n", pc->power_buckets);
+
+	pc->fftw_in = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * pc->fft_size);
+	pc->fftw_out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * pc->fft_size);
+	pc->window = (float*)fftwf_malloc(sizeof(float) * pc->fft_size);
+	pc->fft_power = (float*)malloc(sizeof(float) * pc->fft_size);
+	pc->power_accumulation = (float*)calloc(pc->power_buckets, sizeof(float));
+	pc->accumulation_count = 0;
+	if (!pc->fftw_in
+	 || !pc->fftw_out
+	 || !pc->window
+	 || !pc->fft_power
+	 || !pc->power_accumulation)
+	{
+		fprintf(stderr, "Unable to allocate FFT memory\n");
+		return false;
+	}
+
+	pc->fftw_plan = fftwf_plan_dft_1d(pc->fft_size, pc->fftw_in, pc->fftw_out, FFTW_FORWARD, FFTW_MEASURE);
+fprintf(stderr, "FFT Size %d, in=%p, out=%p\n", pc->fft_size, pc->fftw_in, pc->fftw_out);
+
+	// Populate the window function
+	for (int s = 0; s < pc->fft_size; s++) {
+		pc->window[s] = (float) (0.5f * (1.0f - cos(2 * M_PI * s / (pc->fft_size - 1))));
+	}
+
+	return true;
 }
 
 // Set up a receiver data stream on the specified channel
@@ -525,6 +680,7 @@ ClockTime clock_time()
 void default_parameters(ProgramConfiguration* pc)
 {
 	memset(pc, 0, sizeof(*pc));
+	pc->crop_ratio = 0.25;
 	pc->scan_time = 10;
 }
 
@@ -556,11 +712,15 @@ void usage(int exit_code)
 		"Usage: powerscan [ options... ]\n"
 		"\t-v\t\tDisplay detailed information\n"
 		"\t-d device\tSelect an SDR device (\"help\" for a list)\n"
+		"\t-C channel\tSelect an SDR channel\n"
 		"\t-s freq\t\tStart frequency\n"
 		"\t-e freq\t\tEnd frequency\n"
 		"\t-r freq\t\tFrequency resolution\n"
-		"\t-t time\t\tComplete each scan in this many seconds\n"
+		"\t-R freq\t\tSample rate upper limit\n"
+		"\t-c ratio\tCrop ratio, how much of each tuning band to ignore (0-0.6)\n"
+		"\t-t time\t\tComplete each scan in this many seconds (default 10)\n"
 //		"\t-a name\t\tSelect antenna\n"
+		"\t-g gain\t\tReceive gainn"
 		"\t-1\t\tMake a single scan\n"
 		"\t-l count\tScan this many times\n"
 		"\t-h\t\tThis help message\n"
@@ -573,7 +733,7 @@ bool gather_parameters(ProgramConfiguration* pc, int argc, char **argv)
 	int	opt;
 
 	default_parameters(pc);
-	while ((opt = getopt(argc, argv, "vd:C:a:s:e:r:c:1l:t:h?")) != -1) {
+	while ((opt = getopt(argc, argv, "vd:C:a:g:s:e:r:c:1l:t:h?")) != -1) {
 		switch (opt) {
 		case 'v':		// verbose output
 			pc->verbose = stderr;
@@ -598,6 +758,10 @@ bool gather_parameters(ProgramConfiguration* pc, int argc, char **argv)
 			break;
 #endif
 
+		case 'g':
+			pc->gain = atol(optarg);
+			break;
+
 		case 's':
 			pc->start_frequency = frequency_from_str(optarg);
 			break;
@@ -608,6 +772,10 @@ bool gather_parameters(ProgramConfiguration* pc, int argc, char **argv)
 
 		case 'r':
 			pc->frequency_resolution = frequency_from_str(optarg);
+			break;
+
+		case 'R':
+			pc->requested_sample_rate = frequency_from_str(optarg);
 			break;
 
 		case 't':

@@ -26,11 +26,14 @@ include_directories(${SoapySDR_INCLUDE_DIRS})
 list(APPEND TOOLS_LIBS ${SoapySDR_LIBRARIES})
 
 # Use the fftw library:
-if(MSVC)
-	LIST(APPEND TOOLS_LINK_LIBS ${FFTW_LIBRARIES})
-else()
-	LIST(APPEND TOOLS_LINK_LIBS fftw3f)
-endif()
+find_library(
+    FFTW3F_LIBRARIES NAMES fftw3f
+    PATHS /usr/lib /usr/lib64 /usr/local/lib
+) 
+if (FFTW3F_LIBRARIES)
+    list(APPEND TOOLS_LIBS ${FFTW3F_LIBRARIES})
+endif ()
+
 
 # Use the libm math library if it's available
 find_library(
