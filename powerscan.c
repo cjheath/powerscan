@@ -1,5 +1,8 @@
 /*
  * powerscan: Measure a power spectrum from a SoapySDR receiver
+ *
+ * Example: Scan the FM broadcast band for ten seconds:
+ *	powerscan -v -t 5 -l 2 -d driver=hackrf -g 77 -s 88m 108m  
  */
 #include	<getopt.h>
 #include	<stdlib.h>
@@ -141,7 +144,7 @@ bool scan(ProgramConfiguration* pc)
 {
 	SoapySDRDevice_setSampleRate(pc->device, SOAPY_SDR_RX, pc->sdr_channel, pc->sample_rate);
 
-	ClockTime	scan_start_time = clock_time();
+	// ClockTime	scan_start_time = clock_time();
 	Frequency	frequency = pc->tuning_start;
 
 	for (int i = 0; i < pc->tuning_count; i++, frequency += pc->tuning_bandwidth)
@@ -219,6 +222,7 @@ bool receive_block(ProgramConfiguration* pc, Frequency frequency)
 	long		timeout = 1000000;	// Timeout on this read (microseconds)
 	int		samples;
 
+	(void)(frequency);
 	samples = SoapySDRDevice_readStream(pc->device, pc->stream, buffers, MAX_SAMPLES, &flags, &buffer_time, timeout);
 	if (samples < 0) {
 		fprintf(stderr, "Error: reading stream %d\n", samples);
@@ -279,8 +283,9 @@ void	handle_fft_out(ProgramConfiguration* pc)
 {
 	for (int s = 1; s < pc->fft_size; s++)
 	{
-		// fftw_out[0] is DC, then center to min-freq = max-freq back to centre 
-		// REVISIT: Re-order the FFT output bins from min-freq to max-freq
+		// fftw_out is rotated, so that the first bin is centre (DC).
+		// Higher frequencies extend to the middle of the array.
+		// Progressively lower frequencies run backwards from the end.
 		pc->fft_power[s-1] = cabs(pc->fftw_out[s] /* /pc->fft_size */);
 	}
 
@@ -349,10 +354,10 @@ void list_sdr_devices(FILE* fp)
 
 	fprintf(fp, "Available devices are:\n");
 	kw_args = SoapySDRDevice_enumerate(NULL, &kw_length);
-	for (int i = 0; i < kw_length; i++)
+	for (unsigned i = 0; i < kw_length; i++)
 	{
 		fprintf(fp, "\t%d: ", i);
-		for (int j = 0; j < kw_args[i].size; j++)
+		for (unsigned j = 0; j < kw_args[i].size; j++)
 			fprintf(fp, "%s=%s ", kw_args[i].keys[j], kw_args[i].vals[j]);
 		fprintf(fp, "\n");
 	}
@@ -368,7 +373,7 @@ void list_device_capabilities(ProgramConfiguration* pc)
 	if (pc->verbose)
 	{
 		fprintf(pc->verbose, "SoapySDR Device capabilities:\n");
-		for (int i = 0; i < arg.size; i++)
+		for (unsigned i = 0; i < arg.size; i++)
 			fprintf(pc->verbose, "\t%s\t%s\n", arg.keys[i], arg.vals[i]);
 		fprintf(pc->verbose, "\n");
 	}
@@ -383,7 +388,7 @@ void list_sample_rates(ProgramConfiguration* pc)
 	if (pc->verbose)
 	{
 		fprintf(pc->verbose, "SoapySDR Device (Channel 0 Receive) has %zu sample rates:", pc->num_sample_rates);
-		for (int i = 0; i < pc->num_sample_rates; i++)
+		for (unsigned i = 0; i < pc->num_sample_rates; i++)
 			fprintf(pc->verbose, " %.0f", pc->sample_rates[i]);
 		fprintf(pc->verbose, "\n");
 	}
@@ -393,7 +398,7 @@ void list_sample_rates(ProgramConfiguration* pc)
 void select_sample_rate(ProgramConfiguration* pc)
 {
 	// Choose the highest sample rate not greater than requested
-	for (int i = 0; i < pc->num_sample_rates; i++)
+	for (unsigned i = 0; i < pc->num_sample_rates; i++)
 		if (pc->sample_rates[i] > pc->sample_rate	// Faster than we've seen
 		 && (pc->requested_sample_rate == 0 || pc->sample_rates[i] <= pc->requested_sample_rate))
 			pc->sample_rate = pc->sample_rates[i];
@@ -500,7 +505,7 @@ void list_channel_variables(ProgramConfiguration* pc)
 	if (pc->verbose && channel_info.size > 0)
 	{
 		fprintf(pc->verbose, "%ld info items for channel %d: ", channel_info.size, pc->sdr_channel);
-		for (int j = 0; j < channel_info.size; j++)
+		for (unsigned j = 0; j < channel_info.size; j++)
 			fprintf(pc->verbose, "%s=%s ", channel_info.keys[j], channel_info.vals[j]);
 		fprintf(pc->verbose, "\n");
 	}
@@ -602,7 +607,7 @@ const char* setup_stream(ProgramConfiguration* pc)
 		return "Invalid channel selected";
 	}
 
-#if SOAPY_SDR_API_VERSION < 0x00080000
+#if defined(SOAPY_SDR_API_VERSION) && SOAPY_SDR_API_VERSION < 0x00080000
 	// REVISIT: This Soapy API prints an [INFO] message without being asked
 	if (SoapySDRDevice_setupStream(pc->device, &pc->stream, SOAPY_SDR_RX, SOAPY_SDR_CS16, &sdr_channel, 1, &stream_args) != 0)
 		return SoapySDRDevice_lastError();
@@ -643,6 +648,7 @@ interrupt_handler(int signum)
 #else
 void interrupt_handler(int signum)
 {
+	(void)(signum);
 	interrupt_request();
 }
 #endif

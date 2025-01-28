@@ -2,8 +2,10 @@
 # powerscan project build instructions for CMake
 #
 cmake_minimum_required(VERSION 2.8.0)
-project(powerscan C)
+set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_C_STANDARD 99)
+
+project(powerscan C CXX)
 
 # include some cmake modules
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
